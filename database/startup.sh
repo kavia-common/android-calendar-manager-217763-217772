@@ -46,7 +46,12 @@ JSON
 fi
 
 # Find PostgreSQL version and set paths
-PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
+PG_VERSION=$(ls /usr/lib/postgresql/ 2>/dev/null | head -1)
+if [ -z "${PG_VERSION}" ]; then
+  echo "ERROR: PostgreSQL binaries not found under /usr/lib/postgresql."
+  echo "Please ensure the base image contains PostgreSQL or adjust paths accordingly."
+  exit 1
+fi
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
 echo "Found PostgreSQL version: ${PG_VERSION}"
@@ -192,62 +197,81 @@ bootstrap_db_visualizer() {
   echo ""
   echo "Bootstrapping db_visualizer (Node.js) service..."
 
-  # Prefer Node 18; if nvm present, try to use specified version
-  if command -v nvm >/dev/null 2>&1; then
-    echo "nvm detected, using Node ${NODE_VERSION}"
-    # shellcheck disable=SC1090
-    source "$HOME/.nvm/nvm.sh" 2>/dev/null || true
-    nvm install "${NODE_VERSION}" >/dev/null 2>&1 || true
-    nvm use "${NODE_VERSION}" >/dev/null 2>&1 || true
-  else
-    if command -v node >/dev/null 2>&1; then
-      NODE_ACTUAL="$(node -v 2>/dev/null || true)"
-      echo "Using system Node ${NODE_ACTUAL}"
-    else
-      echo "WARNING: Node.js not found in PATH. Ensure Node 18 is installed in the image."
-    fi
-  fi
-
-  # Ensure npm exists
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "ERROR: npm is not available. Cannot install db_visualizer dependencies."
+  # Detect Node/npm availability early
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: Node.js and/or npm not found in the base image."
+    echo "Please ensure the database image includes Node.js 18+ and npm."
+    echo "For example, install Node 18.x in the image before running this script."
     return 1
   fi
+
+  # Show versions for diagnostics
+  echo "Node version: $(node -v 2>/dev/null || echo 'unknown')"
+  echo "npm version: $(npm -v 2>/dev/null || echo 'unknown')"
 
   pushd "${DBV_DIR}" >/dev/null 2>&1 || {
     echo "ERROR: Could not access ${DBV_DIR}"
     return 1
   }
 
-  # Ensure dependencies are installed if express is missing
-  if [ ! -d "node_modules/express" ]; then
-    if [ -f "package-lock.json" ]; then
-      echo "Installing dependencies with npm ci..."
-      npm ci --no-audit --no-fund || {
-        echo "npm ci failed, attempting npm install..."
-        npm install --no-audit --no-fund || {
-          echo "ERROR: npm dependency installation failed."
-          popd >/dev/null 2>&1
-          return 1
-        }
-      }
-    else
-      echo "Installing dependencies with npm install..."
-      npm install --no-audit --no-fund || {
+  # Ensure package.json has a proper start script and express dependency
+  if ! grep -q '"start": "node server.js --host 0.0.0.0"' package.json 2>/dev/null; then
+    echo "WARNING: Missing or incorrect start script. Patching package.json..."
+    # naive patch: ensure scripts.start exists (fallback if structure changed)
+    tmpfile="$(mktemp)"
+    node -e "const fs=require('fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));p.scripts=p.scripts||{};p.scripts.start='node server.js --host 0.0.0.0';fs.writeFileSync(f, JSON.stringify(p,null,2));" || true
+  fi
+
+  if ! grep -q '"express"' package.json 2>/dev/null; then
+    echo "WARNING: express dependency missing. Adding express@^4..."
+    node -e "const fs=require('fs');const f='package.json';const p=JSON.parse(fs.readFileSync(f,'utf8'));p.dependencies=p.dependencies||{};p.dependencies.express='^4.19.2';fs.writeFileSync(f, JSON.stringify(p,null,2));" || true
+  fi
+
+  # Always start from a clean install to avoid stale/broken node_modules
+  if [ -d "node_modules" ]; then
+    echo "Removing stale node_modules to ensure clean install..."
+    rm -rf node_modules
+  fi
+
+  # Prefer npm ci when lockfile exists
+  if [ -f "package-lock.json" ]; then
+    echo "Installing dependencies with npm ci..."
+    if ! npm ci --no-audit --no-fund; then
+      echo "npm ci failed, falling back to npm install..."
+      if ! npm install --no-audit --no-fund; then
         echo "ERROR: npm dependency installation failed."
         popd >/dev/null 2>&1
         return 1
-      }
+      fi
     fi
   else
-    echo "Dependencies already present (express found)."
+    echo "Installing dependencies with npm install..."
+    if ! npm install --no-audit --no-fund; then
+      echo "ERROR: npm dependency installation failed."
+      popd >/dev/null 2>&1
+      return 1
+    fi
   fi
 
-  # Verify that express resolves before starting
-  if ! node -e "require.resolve('express')" >/dev/null 2>&1; then
-    echo "ERROR: Unable to resolve 'express' after installation."
-    popd >/dev/null 2>&1
-    return 1
+  # Validate express resolution using a runtime require() test
+  if ! node -e "require('express'); console.log('express-ok')" >/dev/null 2>&1; then
+    echo "Express failed to resolve after install. Capturing diagnostics..."
+    echo "npm -v: $(npm -v 2>/dev/null || echo 'unknown')"
+    echo "package.json:"
+    cat package.json || true
+    echo "Attempting explicit install: npm install express@^4 ..."
+    if ! npm install express@^4 --no-audit --no-fund; then
+      echo "ERROR: explicit express install failed."
+      popd >/dev/null 2>&1
+      return 1
+    fi
+
+    # Retry express resolution
+    if ! node -e "require('express'); console.log('express-ok')" >/dev/null 2>&1; then
+      echo "ERROR: Express still cannot be resolved after explicit install."
+      popd >/dev/null 2>&1
+      return 1
+    fi
   fi
 
   # Export the env vars for this process
@@ -256,21 +280,33 @@ bootstrap_db_visualizer() {
   [ -f "./postgres.env" ] && source "./postgres.env"
   set +a
 
-  # Start the Node server in the background if not already running
+  # Start the Node server only if the express check succeeded above
   if pgrep -f "node .*server.js" >/dev/null 2>&1; then
     echo "db_visualizer server already running."
   else
     echo "Starting db_visualizer server..."
-    # Start in background and redirect output
     node server.js --host 0.0.0.0 >/var/log/db_visualizer.log 2>&1 &
-    echo "db_visualizer started. Logs: /var/log/db_visualizer.log"
+    SERVER_PID=$!
+    sleep 1
+    if ps -p "$SERVER_PID" > /dev/null 2>&1; then
+      echo "db_visualizer started (PID: $SERVER_PID). Logs: /var/log/db_visualizer.log"
+    else
+      echo "ERROR: db_visualizer failed to start. Check /var/log/db_visualizer.log"
+      popd >/dev/null 2>&1
+      return 1
+    fi
   fi
 
   popd >/dev/null 2>&1 || true
 }
 
 # Call bootstrap after PostgreSQL is confirmed ready
-bootstrap_db_visualizer || echo "db_visualizer bootstrap encountered errors; check logs."
+if ! bootstrap_db_visualizer; then
+  echo "db_visualizer bootstrap encountered errors; check logs."
+  # Do not exit non-zero to avoid breaking DB container if Node is optional,
+  # but signal clearly in logs. If strict behavior is desired, uncomment below:
+  # exit 1
+fi
 
 # Ensure gradlew shims are executable if present (helps CI pipelines)
 if [ -f "${SCRIPT_DIR}/../android_frontend/gradlew" ]; then chmod +x "${SCRIPT_DIR}/../android_frontend/gradlew" || true; fi
