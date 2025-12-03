@@ -6,7 +6,14 @@ DB_USER="appuser"
 DB_PASSWORD="dbuser123"
 DB_PORT="5000"
 
+# Resolve script directory to ensure all relative paths are correct
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "Starting PostgreSQL setup..."
+
+# Ensure db_visualizer dir exists before writing files to it
+mkdir -p "${SCRIPT_DIR}/db_visualizer"
 
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
@@ -25,8 +32,8 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
     
     # Check if connection info file exists
-    if [ -f "db_connection.txt" ]; then
-        echo "Or use: $(cat db_connection.txt)"
+    if [ -f "${SCRIPT_DIR}/db_connection.txt" ]; then
+        echo "Or use: $(cat "${SCRIPT_DIR}/db_connection.txt")"
     fi
     
     echo ""
@@ -130,11 +137,11 @@ GRANT CREATE ON SCHEMA public TO ${DB_USER};
 EOF
 
 # Save connection command to a file
-echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
-echo "Connection string saved to db_connection.txt"
+echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > "${SCRIPT_DIR}/db_connection.txt"
+echo "Connection string saved to ${SCRIPT_DIR}/db_connection.txt"
 
-# Save environment variables to a file
-cat > db_visualizer/postgres.env << EOF
+# Save environment variables to a file within db_visualizer directory
+cat > "${SCRIPT_DIR}/db_visualizer/postgres.env" << EOF
 export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
 export POSTGRES_PASSWORD="${DB_PASSWORD}"
@@ -148,9 +155,9 @@ echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
 echo ""
 
-echo "Environment variables saved to db_visualizer/postgres.env"
-echo "To use with Node.js viewer, run: source db_visualizer/postgres.env"
+echo "Environment variables saved to ${SCRIPT_DIR}/db_visualizer/postgres.env"
+echo "To use with Node.js viewer, run: source ${SCRIPT_DIR}/db_visualizer/postgres.env"
 
 echo "To connect to the database, use one of the following commands:"
 echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-echo "$(cat db_connection.txt)"
+echo "$(cat "${SCRIPT_DIR}/db_connection.txt")"
