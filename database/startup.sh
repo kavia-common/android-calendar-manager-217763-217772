@@ -32,7 +32,7 @@ if [ ! -f "${DBV_DIR}/package.json" ]; then
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "pg": "^8.11.3",
     "mysql2": "^3.6.3",
     "sqlite3": "^5.1.6",
@@ -273,8 +273,8 @@ bootstrap_db_visualizer() {
 bootstrap_db_visualizer || echo "db_visualizer bootstrap encountered errors; check logs."
 
 # Ensure gradlew shims are executable if present (helps CI pipelines)
-chmod +x "${SCRIPT_DIR}/../android_frontend/gradlew" 2>/dev/null || true
-chmod +x "${SCRIPT_DIR}/../backend/gradlew" 2>/dev/null || true
+if [ -f "${SCRIPT_DIR}/../android_frontend/gradlew" ]; then chmod +x "${SCRIPT_DIR}/../android_frontend/gradlew" || true; fi
+if [ -f "${SCRIPT_DIR}/../backend/gradlew" ]; then chmod +x "${SCRIPT_DIR}/../backend/gradlew" || true; fi
 # Also ensure repo-level gradlew shims are executable if present
-chmod +x "${SCRIPT_DIR}/../../gradlew" 2>/dev/null || true
-chmod +x "${SCRIPT_DIR}/../gradlew" 2>/dev/null || true
+if [ -f "${SCRIPT_DIR}/../../gradlew" ]; then chmod +x "${SCRIPT_DIR}/../../gradlew" || true; fi
+if [ -f "${SCRIPT_DIR}/../gradlew" ]; then chmod +x "${SCRIPT_DIR}/../gradlew" || true; fi

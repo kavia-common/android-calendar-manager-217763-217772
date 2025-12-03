@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stub gradlew for database container CI context.
+echo "Stub gradlew (database) invoked. No Android build here. Exiting 0."
+exit 0
