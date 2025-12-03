@@ -1,10 +1,13 @@
 #!/bin/bash
 
-# Minimal PostgreSQL startup script with full paths
+# Minimal PostgreSQL startup script with full paths + Node db_visualizer bootstrap
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
 DB_PORT="5000"
+
+# Optional: allow overriding Node version through env var (default to 18)
+NODE_VERSION="${NODE_VERSION:-18}"
 
 # Resolve script directory to ensure all relative paths are correct
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +16,8 @@ cd "$SCRIPT_DIR"
 echo "Starting PostgreSQL setup..."
 
 # Ensure db_visualizer dir exists before writing files to it
-mkdir -p "${SCRIPT_DIR}/db_visualizer"
+DBV_DIR="${SCRIPT_DIR}/db_visualizer"
+mkdir -p "${DBV_DIR}"
 
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
@@ -35,10 +39,9 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     if [ -f "${SCRIPT_DIR}/db_connection.txt" ]; then
         echo "Or use: $(cat "${SCRIPT_DIR}/db_connection.txt")"
     fi
-    
-    echo ""
-    echo "Script stopped - server already running."
-    exit 0
+
+    # Even if PostgreSQL is already running, ensure db_visualizer is bootstrapped
+    # Later in script we'll call a function to install/start Node service if not running.
 fi
 
 # Also check if there's a PostgreSQL process running (in case pg_isready fails)
@@ -49,8 +52,6 @@ if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
     # Try to connect and verify the database exists
     if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
         echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
     fi
 fi
 
@@ -60,15 +61,14 @@ if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
     sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
 fi
 
-# Start PostgreSQL server in background
-echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+# Start PostgreSQL server in background if not already started
+if ! sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
+  echo "Starting PostgreSQL server..."
+  sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+fi
 
 # Wait for PostgreSQL to start
 echo "Waiting for PostgreSQL to start..."
-sleep 5
-
-# Check if PostgreSQL is running
 for i in {1..15}; do
     if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
         echo "PostgreSQL is ready!"
@@ -113,10 +113,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 
@@ -141,7 +137,7 @@ echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME
 echo "Connection string saved to ${SCRIPT_DIR}/db_connection.txt"
 
 # Save environment variables to a file within db_visualizer directory
-cat > "${SCRIPT_DIR}/db_visualizer/postgres.env" << EOF
+cat > "${DBV_DIR}/postgres.env" << EOF
 export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
 export POSTGRES_PASSWORD="${DB_PASSWORD}"
@@ -155,9 +151,85 @@ echo "User: ${DB_USER}"
 echo "Port: ${DB_PORT}"
 echo ""
 
-echo "Environment variables saved to ${SCRIPT_DIR}/db_visualizer/postgres.env"
-echo "To use with Node.js viewer, run: source ${SCRIPT_DIR}/db_visualizer/postgres.env"
+echo "Environment variables saved to ${DBV_DIR}/postgres.env"
+echo "To use with Node.js viewer, run: source ${DBV_DIR}/postgres.env"
 
 echo "To connect to the database, use one of the following commands:"
 echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
 echo "$(cat "${SCRIPT_DIR}/db_connection.txt")"
+
+###############################################################################
+# Bootstrap and start the db_visualizer Node service
+###############################################################################
+
+bootstrap_db_visualizer() {
+  echo ""
+  echo "Bootstrapping db_visualizer (Node.js) service..."
+
+  # Prefer Node 18; if nvm present, try to use specified version
+  if command -v nvm >/dev/null 2>&1; then
+    echo "nvm detected, using Node ${NODE_VERSION}"
+    # shellcheck disable=SC1090
+    source "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+    nvm install "${NODE_VERSION}" >/dev/null 2>&1 || true
+    nvm use "${NODE_VERSION}" >/dev/null 2>&1 || true
+  else
+    if command -v node >/dev/null 2>&1; then
+      NODE_ACTUAL="$(node -v 2>/dev/null || true)"
+      echo "Using system Node ${NODE_ACTUAL}"
+    else
+      echo "WARNING: Node.js not found in PATH. Ensure Node 18 is installed in the image."
+    fi
+  fi
+
+  # Ensure npm exists
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "ERROR: npm is not available. Cannot install db_visualizer dependencies."
+    return 1
+  fi
+
+  pushd "${DBV_DIR}" >/dev/null 2>&1 || {
+    echo "ERROR: Could not access ${DBV_DIR}"
+    return 1
+  }
+
+  # Install dependencies with npm ci if lockfile exists, otherwise npm install
+  if [ -f "package-lock.json" ]; then
+    echo "Installing dependencies with npm ci..."
+    npm ci --no-audit --no-fund || {
+      echo "npm ci failed, attempting npm install..."
+      npm install --no-audit --no-fund || {
+        echo "ERROR: npm dependency installation failed."
+        popd >/dev/null 2>&1
+        return 1
+      }
+    }
+  else
+    echo "Installing dependencies with npm install..."
+    npm install --no-audit --no-fund || {
+      echo "ERROR: npm dependency installation failed."
+      popd >/dev/null 2>&1
+      return 1
+    }
+  fi
+
+  # Start the Node server in the background if not already running
+  if pgrep -f "node .*server.js" >/dev/null 2>&1; then
+    echo "db_visualizer server already running."
+  else
+    echo "Starting db_visualizer server..."
+    # Export the env vars for this process
+    set -a
+    # shellcheck disable=SC1090
+    [ -f "./postgres.env" ] && source "./postgres.env"
+    set +a
+    # Start in background and redirect output
+    npm run start >/var/log/db_visualizer.log 2>&1 &
+    echo "db_visualizer started. Logs: /var/log/db_visualizer.log"
+  fi
+
+  popd >/dev/null 2>&1 || true
+}
+
+# Call bootstrap after PostgreSQL is confirmed ready
+bootstrap_db_visualizer || echo "db_visualizer bootstrap encountered errors; check logs."
