@@ -19,6 +19,32 @@ echo "Starting PostgreSQL setup..."
 DBV_DIR="${SCRIPT_DIR}/db_visualizer"
 mkdir -p "${DBV_DIR}"
 
+# If package.json is missing, create a minimal one with express dependency to avoid MODULE_NOT_FOUND
+if [ ! -f "${DBV_DIR}/package.json" ]; then
+  cat > "${DBV_DIR}/package.json" << 'JSON'
+{
+  "name": "simple-db-viewer",
+  "version": "1.0.0",
+  "description": "Simple database viewer for PostgreSQL, MySQL, SQLite, and MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --host 0.0.0.0",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "mysql2": "^3.6.3",
+    "sqlite3": "^5.1.6",
+    "mongodb": "^6.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+JSON
+fi
+
 # Find PostgreSQL version and set paths
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
@@ -193,38 +219,50 @@ bootstrap_db_visualizer() {
     return 1
   }
 
-  # Install dependencies with npm ci if lockfile exists, otherwise npm install
-  if [ -f "package-lock.json" ]; then
-    echo "Installing dependencies with npm ci..."
-    npm ci --no-audit --no-fund || {
-      echo "npm ci failed, attempting npm install..."
+  # Ensure dependencies are installed if express is missing
+  if [ ! -d "node_modules/express" ]; then
+    if [ -f "package-lock.json" ]; then
+      echo "Installing dependencies with npm ci..."
+      npm ci --no-audit --no-fund || {
+        echo "npm ci failed, attempting npm install..."
+        npm install --no-audit --no-fund || {
+          echo "ERROR: npm dependency installation failed."
+          popd >/dev/null 2>&1
+          return 1
+        }
+      }
+    else
+      echo "Installing dependencies with npm install..."
       npm install --no-audit --no-fund || {
         echo "ERROR: npm dependency installation failed."
         popd >/dev/null 2>&1
         return 1
       }
-    }
+    fi
   else
-    echo "Installing dependencies with npm install..."
-    npm install --no-audit --no-fund || {
-      echo "ERROR: npm dependency installation failed."
-      popd >/dev/null 2>&1
-      return 1
-    }
+    echo "Dependencies already present (express found)."
   fi
+
+  # Verify that express resolves before starting
+  if ! node -e "require.resolve('express')" >/dev/null 2>&1; then
+    echo "ERROR: Unable to resolve 'express' after installation."
+    popd >/dev/null 2>&1
+    return 1
+  fi
+
+  # Export the env vars for this process
+  set -a
+  # shellcheck disable=SC1090
+  [ -f "./postgres.env" ] && source "./postgres.env"
+  set +a
 
   # Start the Node server in the background if not already running
   if pgrep -f "node .*server.js" >/dev/null 2>&1; then
     echo "db_visualizer server already running."
   else
     echo "Starting db_visualizer server..."
-    # Export the env vars for this process
-    set -a
-    # shellcheck disable=SC1090
-    [ -f "./postgres.env" ] && source "./postgres.env"
-    set +a
     # Start in background and redirect output
-    npm run start >/var/log/db_visualizer.log 2>&1 &
+    node server.js --host 0.0.0.0 >/var/log/db_visualizer.log 2>&1 &
     echo "db_visualizer started. Logs: /var/log/db_visualizer.log"
   fi
 
@@ -233,3 +271,10 @@ bootstrap_db_visualizer() {
 
 # Call bootstrap after PostgreSQL is confirmed ready
 bootstrap_db_visualizer || echo "db_visualizer bootstrap encountered errors; check logs."
+
+# Ensure gradlew shims are executable if present (helps CI pipelines)
+chmod +x "${SCRIPT_DIR}/../android_frontend/gradlew" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/../backend/gradlew" 2>/dev/null || true
+# Also ensure repo-level gradlew shims are executable if present
+chmod +x "${SCRIPT_DIR}/../../gradlew" 2>/dev/null || true
+chmod +x "${SCRIPT_DIR}/../gradlew" 2>/dev/null || true
